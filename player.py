@@ -1,5 +1,5 @@
-from game.unit import create_soldier, create_setpoint, create_medical
 from typing import List
+from game.unit import create_soldier, create_setpoint, create_medical
 
 class Player:
     def __init__(self, name: str):
