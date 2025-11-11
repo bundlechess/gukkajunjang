@@ -1,6 +1,4 @@
 from dataclasses import dataclass
-import random
-from typing import Optional
 
 @dataclass
 class Unit:
@@ -22,18 +20,18 @@ class Unit:
     def is_alive(self):
         return self.health > 0
 
-# === 유닛 종류 ===
-def create_pinpoint(owner):
+# === 유닛 생성 함수 ===
+def create_pinpoint(owner: str) -> Unit:
     return Unit("Pinpoint", movable=False, health=100, attack=0, owner=owner, is_pinpoint=True)
 
-def create_setpoint(owner):
+def create_setpoint(owner: str) -> Unit:
     return Unit("Setpoint", movable=False, health=60, attack=5, owner=owner, is_setpoint=True)
 
-def create_soldier(owner):
+def create_soldier(owner: str) -> Unit:
     return Unit("Soldier", movable=True, health=20, attack=2, owner=owner)
 
-def create_medical(owner):
+def create_medical(owner: str) -> Unit:
     return Unit("Medical", movable=False, health=40, attack=0, owner=owner, is_medical=True)
 
-def create_maintenance(owner):
+def create_maintenance(owner: str) -> Unit:
     return Unit("Maintenance", movable=False, health=80, attack=0, owner=owner, is_maintenance=True)
