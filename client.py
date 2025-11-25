@@ -10,15 +10,358 @@ import math # visual_main의 의존성
 # 그대로 복사해서 붙여넣으세요.
 # 'Game' 클래스 import 부분부터 'draw_game_state' 함수 끝까지 전부 필요합니다.
 # ==================================================================================
-# ... (visual_main.py의 내용을 여기에 붙여넣기) ...
-# ... (draw_game_state 함수까지 포함) ...
+import pygame
+import sys
+import math
+import random
+import os
+from collections import deque
+
+from game.game_logic import Game
+from game.unit import create_soldier, create_setpoint, create_medical, create_wall
+
+# ================== 화면/상수 ==================
+LOGICAL_W, LOGICAL_H = 1280, 720   # 고정 논리 해상도
+FPS = 45
+HEX_SIZE = 28
+SQRT3 = math.sqrt(3)
+
+COLOR_BG = (35, 36, 40)
+COLOR_GRID = (92, 96, 105)
+COLOR_ALLY = (110, 170, 255)
+COLOR_ENEMY = (255, 130, 130)
+COLOR_BOUNDARY = (245, 215, 110)
+COLOR_PINPOINT_ALLY = (20, 120, 255)
+COLOR_PINPOINT_ENEMY = (255, 80, 80)
+COLOR_GOLD = (255, 215, 0)
+COLOR_TEXT = (235, 238, 242)
+COLOR_PANEL = (20, 21, 24, 140)
+COLOR_BUTTON = (32, 34, 38, 200)
+COLOR_BUTTON_HL = (60, 64, 72, 220)
+COLOR_HL = (255, 255, 0)
+COLOR_ERR = (255, 80, 80)
+COLOR_OK = (140, 220, 140)
+COLOR_CAPTURE = (255, 230, 120)
+COLOR_BAR_BG = (60, 60, 70)
+COLOR_BAR_FG = (255, 220, 120)
+
+# 체력바 색상 (아군: 초록/회색, 적군: 빨강/회색)
+COLOR_HP_ALLY  = (80, 220, 100)
+COLOR_HP_ENEMY = (220, 80, 80)
+COLOR_HP_BG    = (90, 90, 90)
+
+# 💥 데미지 팝업 색상 (가해자 기준)
+COLOR_DMG_ALLY  = (110, 170, 255)
+COLOR_DMG_ENEMY = (255, 110, 110)
+
+# 벽 부수기 표시용 색
+COLOR_WALL_BREAK = (140, 200, 255)
+
+STEP_TIME = 0.4
+CAPTURE_TIME = 8.0
+COMBAT_TICK = 2.0     # 전투는 2초마다 1번 계산
+COMBAT_SPEED = 0.6    # 전체 전투 속도 배율
+DEBUG_OVERLAY = False  # F9로 HP/ATK 표시 토글
+
+# ================== 폰트/텍스트 캐시 ==================
+_font_cache, _text_cache = {}, {}
+def load_korean_font(size=20):
+    key = ("font", size)
+    if key in _font_cache:
+        return _font_cache[key]
+    candidates = [
+        r"C:\Windows\Fonts\malgun.ttf",
+        r"C:\Windows\Fonts\malgunbd.ttf",
+        r"C:\Windows\Fonts\NanumGothic.ttf",
+        r"/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        r"/System/Library/Fonts\AppleSDGothicNeo.ttc",
+    ]
+    for path in candidates:
+        try:
+            f = pygame.font.Font(path, size)
+            _font_cache[key] = f
+            return f
+        except Exception:
+            pass
+    try:
+        f = pygame.font.SysFont("malgungothic", size)
+    except Exception:
+        f = pygame.font.SysFont(None, size)
+    _font_cache[key] = f
+    return f
+
+def render_text_cached(font, text, color):
+    key = (id(font), text, color)
+    surf = _text_cache.get(key)
+    if surf is None:
+        surf = font.render(text, True, color)
+        _text_cache[key] = surf
+    return surf
+
+# ================== 이미지 로더 ==================
+IMAGE_CACHE = {}
+
+def load_unit_image(name, owner):
+    """
+    name: 'Soldier', 'Wall', 'Setpoint', 'Medical', 'Pinpoint'
+    owner: 'ally' / 'enemy'
+    파일명: assets/{name_lower}_{owner}.png
+    """
+    key = (name, owner)
+    if key in IMAGE_CACHE:
+        return IMAGE_CACHE[key]
+
+    fname = f"{name.lower()}_{owner}.png"
+    path = os.path.join("assets", fname)
+
+    if not os.path.exists(path):
+        # print 경고만, 나머지는 fallback 그리기
+        print(f"[WARN] 이미지 파일 없음: {path}")
+        IMAGE_CACHE[key] = None
+        return None
+
+    try:
+        img = pygame.image.load(path).convert_alpha()
+    except Exception as e:
+        print(f"[ERROR] 이미지 로드 실패: {path} — {e}")
+        IMAGE_CACHE[key] = None
+        return None
+
+    IMAGE_CACHE[key] = img
+    return img
+
+def scale_unit_image(img):
+    if img is None:
+        return None
+    target = int(HEX_SIZE * 1.2)   # 유닛 이미지 크기 (조정 가능)
+    return pygame.transform.smoothscale(img, (target, target))
+
+# ================== 좌표/도형 ==================
+ORIGIN = (LOGICAL_W // 2, LOGICAL_H // 2 + 20)
+
+def axial_to_pixel(q, r, size=HEX_SIZE, origin=ORIGIN):
+    ox, oy = origin
+    x = size * 1.5 * q
+    y = size * (SQRT3 * (r + q/2))
+    return int(ox + x), int(oy + y)
+
+def hex_polygon(cx, cy, size=HEX_SIZE):
+    pts = []
+    for i in range(6):
+        ang = math.radians(60 * i - 30)
+        pts.append((cx + size * math.cos(ang), cy + size * math.sin(ang)))
+    return pts
+
+def nearest_tile_from_pos(game, pos, origin=ORIGIN):
+    mx, my = pos
+    best, best_d2 = None, 1e18
+    for (q, r), tile in game.map.tiles.items():
+        cx, cy = axial_to_pixel(q, r, origin=origin)
+        d2 = (mx - cx) ** 2 + (my - cy) ** 2
+        if d2 < best_d2:
+            best_d2, best = d2, tile
+    return best
+
+def hex_distance(q1, r1, q2, r2):
+    dq = q1 - q2
+    dr = r1 - r2
+    ds = -(q1 + r1) - (-(q2 + r2))
+    return max(abs(dq), abs(dr), abs(ds))
+
+def draw_panel(surface, x, y, w, h, color_rgba):
+    panel = pygame.Surface((w, h), pygame.SRCALPHA)
+    pygame.draw.rect(panel, color_rgba, (0, 0, w, h), border_radius=12)
+    surface.blit(panel, (x, y))
+
+def draw_button(surface, rect, label, font, hovered=False):
+    x, y, w, h = rect
+    panel = pygame.Surface((w, h), pygame.SRCALPHA)
+    pygame.draw.rect(panel, COLOR_BUTTON_HL if hovered else COLOR_BUTTON,
+                     (0, 0, w, h), border_radius=10)
+    surface.blit(panel, (x, y))
+    txt = render_text_cached(font, label, COLOR_TEXT)
+    surface.blit(txt, (x + (w - txt.get_width())//2, y + (h - txt.get_height())//2))
+
+# ================== BFS (좌표 튜플 기반) ==================
+from collections import deque as _deque
+def bfs_path(game, start_tile, goal_tile):
+    """
+    - 일반 유닛(unit) 기준 이동 경로 탐색
+    - 벽(wall)은:
+        * 같은 진영의 벽: 통과/도착 가능
+        * 적 진영 벽  : 통과 불가, 단 '목표 타일(goal)'이면 도착까지는 허용
+          (목표 타일 도착 시, 실제 이동 처리에서 '벽 부수기 타이머' 시작)
+    """
+    start = (start_tile.q, start_tile.r)
+    goal = (goal_tile.q, goal_tile.r)
+    if start == goal:
+        return [start_tile]
+
+    mover_owner = None
+    if start_tile.unit:
+        mover_owner = start_tile.unit.owner
+
+    q = _deque([start])
+    prev = {start: None}
+
+    while q:
+        cq, cr = q.popleft()
+        for nb in game.map.neighbors(cq, cr):
+            key = (nb.q, nb.r)
+            if key in prev:
+                continue
+
+            # 다른 일반 유닛이 있으면 통과 불가 (단 goal은 예외 -> 전투/벽 파괴용)
+            if nb.unit is not None and key != goal:
+                continue
+
+            # 벽 처리: 적의 벽이면 통과 불가 (goal은 예외)
+            wall = getattr(nb, "wall", None)
+            if wall is not None and mover_owner is not None:
+                if wall.owner != mover_owner and key != goal:
+                    continue
+
+            prev[key] = (cq, cr)
+            if key == goal:
+                path_coords, cur = [], goal
+                while cur is not None:
+                    path_coords.append(cur)
+                    cur = prev[cur]
+                path_coords.reverse()
+                return [game.map.get_tile(q, r) for (q, r) in path_coords]
+            q.append(key)
+
+    return None
+
+# ================== 규칙/도우미 ==================
+def find_pinpoint_tile(game, owner='ally'):
+    for t in game.map.tiles.values():
+        if t.unit and t.unit.is_pinpoint and t.unit.owner == owner:
+            return t
+    return None
+
+def recompute_boundaries(game):
+    for tile in game.map.tiles.values():
+        tile.boundary = False
+    for (q, r), tile in game.map.tiles.items():
+        for nb in game.map.neighbors(q, r):
+            if nb.owner != tile.owner:
+                tile.boundary = True
+                break
+
+def can_place_unit_on_tile(game, unit, tile):
+    """
+    설치 규칙:
+    - 모든 유닛: 자기 진영(owner) 타일에만 설치 가능
+    - 병: 일반 유닛(unit)이 없으면 설치 가능, 벽(wall)은 있어도 OK (아군 벽 위 설치 허용)
+    - 벽: 해당 타일에 다른 일반 유닛이 없어야 하고, 기존 벽이 없어야 함
+    - 셋포인트/보건소: 일반 유닛이 없어야 함, 핀포인트 인접 제한 적용
+    """
+    # 소유권 체크
+    if tile.owner != unit.owner:
+        return False, "해당 진영 타일에만 설치할 수 있습니다."
+
+    # 병 유닛: 벽과 겹치기 허용, 일반 유닛만 막음
+    if unit.name == "Soldier":
+        if tile.unit is not None:
+            return False, "이미 유닛이 있습니다."
+
+    # 벽 유닛
+    elif getattr(unit, "is_wall", False):
+        if getattr(tile, "wall", None) is not None:
+            return False, "이미 벽 유닛이 있습니다."
+        if tile.unit is not None:
+            return False, "해당 칸에 다른 유닛이 있어 벽을 설치할 수 없습니다."
+
+    # 그 외(셋포인트, 보건소 등): 일반 유닛이 없어야 함
+    else:
+        if tile.unit is not None:
+            return False, "이미 유닛이 있습니다."
+
+    # 핀포인트 인접 제한:
+    #  - 병/벽은 예외 (둘 다 허용)
+    for nb in game.map.neighbors(tile.q, tile.r):
+        if nb.unit and nb.unit.is_pinpoint and unit.name not in ("Soldier", "Wall"):
+            return False, "핀포인트 인접 타일에는 병/벽 유닛만 설치 가능."
+
+    # 셋포인트 거리 제한
+    if unit.is_setpoint:
+        pp = find_pinpoint_tile(game, owner=unit.owner)
+        if not pp:
+            return False, "핀포인트를 찾을 수 없습니다."
+        if hex_distance(tile.q, tile.r, pp.q, pp.r) > 4:
+            return False, "셋포인트는 핀포인트로부터 4칸 이내만 설치 가능."
+
+    # 보건소는 Player에서 1개 제한 이미 걸려 있음
+    return True, "설치 가능"
+
+# --- 전투 중복 등록 방지용 헬퍼 ---
+def add_battle_once(battles, tile, attacker, defender):
+    for b in battles:
+        if b["tile"] is tile:
+            return False
+    battles.append({"tile": tile, "att": attacker, "def": defender})
+    return True
+
+# ================== 텍스트 유틸(외곽선) ==================
+def blit_text_outline(surface, text, font, x, y,
+                      inner_color, outline_color=(0, 0, 0),
+                      outline_w=2, alpha=255):
+    base = font.render(text, True, inner_color)
+    if alpha < 255:
+        base.set_alpha(alpha)
+    oxys, w = [], outline_w
+    for dx in range(-w, w+1):
+        for dy in range(-w, w+1):
+            if dx*dx + dy*dy <= w*w and not (dx == 0 and dy == 0):
+                oxys.append((dx, dy))
+    out = font.render(text, True, outline_color)
+    if alpha < 255:
+        out.set_alpha(alpha)
+    for dx, dy in oxys:
+        surface.blit(out, (x + dx, y + dy))
+    surface.blit(base, (x, y))
+
+# ================== HP 바 유틸 ==================
+def draw_hp_bar(screen, cx, cy, hp, max_hp, owner, dy=0):
+    """
+    병 유닛용 HP 바.
+    owner: 'ally' 또는 'enemy'
+    dy: 기준 위치에서의 세로 오프셋 (전투 중 위/아래 분리용)
+    """
+    max_hp = float(max_hp)
+    hp = max(0.0, min(float(hp), max_hp))
+    ratio = hp / max_hp if max_hp > 0 else 0.0
+
+    bar_w = HEX_SIZE * 1.4
+    bar_h = 5
+    bx = cx - bar_w / 2
+    by = cy + HEX_SIZE * 0.55 + dy
+
+    # 회색 배경
+    pygame.draw.rect(screen, COLOR_HP_BG, (bx, by, bar_w, bar_h), border_radius=3)
+
+    # 아군/적군에 따라 체력 색상
+    if owner == "ally":
+        fg = COLOR_HP_ALLY
+    else:
+        fg = COLOR_HP_ENEMY
+
+    # 남은 체력 부분
+    pygame.draw.rect(screen, fg, (bx, by, bar_w * ratio, bar_h), border_radius=3)
+
+    # 테두리
+    pygame.draw.rect(screen, (20, 20, 20), (bx, by, bar_w, bar_h), 1, border_radius=3)
+
+# ================== 메인 ==================
+
 
 # ==================================================================================
 # 아래부터는 멀티플레이 전용 클라이언트 로직입니다.
 # visual_main.py의 하단 'def main(): ...' 부분을 아래 코드로 대체한다고 생각하면 됩니다.
 # ==================================================================================
 
-SERVER_IP = '127.0.0.1' # 서버 IP (로컬 테스트용)
+SERVER_IP = '172.16.200.206' # 서버 IP (로컬 테스트용)
 SERVER_PORT = 12345
 BUFFER_SIZE = 4096
 
