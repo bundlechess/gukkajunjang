@@ -8,7 +8,7 @@ import math
 
 from net_common import send_json, recv_json
 
-SERVER_IP = "127.0.0.1"   # 같은 PC면 그대로
+SERVER_IP = "127.0.0.1"   # 다른 PC에서 접속할 때 서버 IP로 바꾸기
 SERVER_PORT = 50000
 
 LOGICAL_W, LOGICAL_H = 1280, 720
@@ -26,12 +26,17 @@ COLOR_CAPTURE = (255, 230, 120)
 COLOR_PINPOINT_ALLY = (20, 120, 255)
 COLOR_PINPOINT_ENEMY = (255, 80, 80)
 COLOR_BATTLE_RING = (255, 180, 140)
+COLOR_WALL_ALLY = (180, 185, 210)
+COLOR_WALL_ENEMY = (210, 150, 150)
+COLOR_WALL_BREAK = (140, 200, 255)
+
 
 def axial_to_pixel(q, r, size=HEX_SIZE, origin=ORIGIN):
     ox, oy = origin
     x = size * 1.5 * q
     y = size * (SQRT3 * (r + q/2))
     return int(ox + x), int(oy + y)
+
 
 def hex_polygon(cx, cy, size=HEX_SIZE):
     pts = []
@@ -44,6 +49,7 @@ def hex_polygon(cx, cy, size=HEX_SIZE):
 server_state: Dict[str, Any] = {}
 my_side: str = "ally"
 running = True
+
 
 def net_thread_main(sock: socket.socket):
     global server_state, my_side, running
@@ -87,7 +93,6 @@ def nearest_tile_from_pos(mouse_pos) -> Tuple[int, int] | None:
 def main():
     global running
 
-    # 서버 접속
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((SERVER_IP, SERVER_PORT))
     print("[CLIENT] 서버 접속:", SERVER_IP, SERVER_PORT)
@@ -122,6 +127,17 @@ def main():
                     selected_type = "setpoint"
                 elif event.key == pygame.K_3:
                     selected_type = "medical"
+                elif event.key == pygame.K_4:
+                    selected_type = "wall"
+                elif event.key == pygame.K_b:
+                    # 구매 (예비 풀에만 쌓임)
+                    send_json(sock, {
+                        "type": "input",
+                        "cmd": {
+                            "kind": "purchase",
+                            "unit_type": selected_type,
+                        },
+                    })
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 tile_coord = nearest_tile_from_pos(mouse_pos)
@@ -141,7 +157,6 @@ def main():
                     u = tile_info.get("unit")
 
                     if u and u["owner"] == my_side and u["name"] == "Soldier":
-                        # 병 선택
                         selected_tile = (tq, tr)
                     elif selected_tile is not None:
                         from_q, from_r = selected_tile
@@ -153,15 +168,36 @@ def main():
                         send_json(sock, {"type": "input", "cmd": cmd})
                         selected_tile = None
 
-                # 우클릭: 현재 선택된 타입 배치
+                # 우클릭: 설치 or 회수
                 elif event.button == 3:
-                    cmd = {
-                        "kind": "place",
-                        "unit_type": selected_type,
-                        "q": tq,
-                        "r": tr,
-                    }
-                    send_json(sock, {"type": "input", "cmd": cmd})
+                    # 먼저 해당 타일에 내 유닛이 있으면 회수 시도
+                    tile_info = None
+                    for t in server_state.get("tiles", []):
+                        if t["q"] == tq and t["r"] == tr:
+                            tile_info = t
+                            break
+
+                    recalled = False
+                    if tile_info is not None:
+                        u = tile_info.get("unit")
+                        if u and u["owner"] == my_side and not u.get("is_pinpoint", False):
+                            send_json(sock, {
+                                "type": "input",
+                                "cmd": {"kind": "recall", "q": tq, "r": tr},
+                            })
+                            recalled = True
+
+                    if not recalled:
+                        # 설치 시도
+                        send_json(sock, {
+                            "type": "input",
+                            "cmd": {
+                                "kind": "place",
+                                "unit_type": selected_type,
+                                "q": tq,
+                                "r": tr,
+                            },
+                        })
 
         # 렌더
         screen.fill(COLOR_BG)
@@ -189,6 +225,27 @@ def main():
                 txt = font_small.render(f"{t['capture_remain']:.1f}s", True, COLOR_CAPTURE)
                 screen.blit(txt, (cx - txt.get_width()//2, cy - HEX_SIZE * 1.3))
 
+        # 벽 / 벽 파괴 링
+        for t in tiles:
+            q, r = t["q"], t["r"]
+            cx, cy = axial_to_pixel(q, r)
+            wall_owner = t.get("wall_owner")
+            if wall_owner:
+                col = COLOR_WALL_ALLY if wall_owner == my_side else COLOR_WALL_ENEMY
+                w = int(HEX_SIZE * 1.1)
+                h = int(HEX_SIZE * 0.6)
+                rect = pygame.Rect(cx - w//2, cy - h//2, w, h)
+                pygame.draw.rect(screen, col, rect, border_radius=4)
+                pygame.draw.rect(screen, (40, 40, 60), rect, 2, border_radius=4)
+
+            if t.get("wall_break_remain") is not None:
+                pygame.draw.circle(screen, COLOR_WALL_BREAK,
+                                   (cx, cy), HEX_SIZE - 8, 2)
+                txt = font_small.render(f"{t['wall_break_remain']:.1f}s",
+                                        True, COLOR_WALL_BREAK)
+                screen.blit(txt, (cx - txt.get_width()//2,
+                                  cy + HEX_SIZE * 0.2))
+
         # 유닛
         for t in tiles:
             q, r = t["q"], t["r"]
@@ -201,6 +258,7 @@ def main():
                 pygame.draw.circle(screen, col, (cx, cy), HEX_SIZE // 2)
             else:
                 pygame.draw.circle(screen, COLOR_TEXT, (cx, cy), HEX_SIZE // 3, 2)
+
             if u["name"] == "Soldier":
                 hp_txt = font_small.render(f"{int(u['health'])}", True, COLOR_TEXT)
                 screen.blit(hp_txt, (cx - hp_txt.get_width()//2, cy + HEX_SIZE * 0.4))
@@ -221,9 +279,12 @@ def main():
             pygame.draw.polygon(screen, COLOR_HL, hex_polygon(cx, cy, HEX_SIZE - 3), 3)
 
         # 상단 정보
-        my_money = players.get(my_side, {}).get("money", 0)
+        my_info = players.get(my_side, {})
+        my_money = my_info.get("money", 0)
+        my_res = my_info.get("reserve", {})
+        reserve_text = f"S:{my_res.get('soldier',0)}  T:{my_res.get('setpoint',0)}  M:{my_res.get('medical',0)}  W:{my_res.get('wall',0)}"
         txt = font.render(
-            f"Side: {my_side.upper()}  Money: {my_money}   (1~3 유닛 선택, 우클릭 배치, 좌클릭 이동)",
+            f"Side: {my_side.upper()}  Money: {my_money}  Reserve({reserve_text})   (1~4 유형, B:구매, 우클릭:설치/회수, 좌클릭:병 이동)",
             True, COLOR_TEXT)
         screen.blit(txt, (12, 12))
 
